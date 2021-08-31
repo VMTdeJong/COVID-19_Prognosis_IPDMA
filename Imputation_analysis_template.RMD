@@ -1,0 +1,972 @@
+---
+title: "COVID-PRECISE - Multiple imputation & analysis template"
+author: "Valentijn de Jong and Thomas Debray"
+date: "May 2021"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{R, include = FALSE}
+cache = T # For quick re-loading the multiple imputations. (note: some checks are performed at the corresponding block) 
+```
+
+# Introduction
+
+This document can serve as a template for validating a model in a data set with missing data. We apply multiple imputation with mice, validate a model by estimating five performance measures, and then show how they can be combined with Rubin's rules. 
+
+We assume that the integrity of the data have been thoroughly checked. Variable names will need to be adapted before using the functions below. Further, variable definitions need to be compared with the variable definitions in the selected models. For instance, the Hu score expects D-dimer in Ferritin equivalent units (FEU), while at many hospitals it is measured in D-dimer units (DDU).
+
+We use a mock data set as an example, to show how the methods can be applied.
+
+# Software  
+  
+  This code was developed using R version `r getRversion()`. Version 4 of R has been a major update, that alters the behavior of many existing packages. Please use version 4.0.0 or later. Open RStudio and verify if your installed version is up-to-date:
+  
+```{r,message=F,warning=F,echo=T,eval=F}
+R.Version()$version.string
+```
+
+
+We will use the (inverse) logit function multiple times:
+```{r}
+inv_logit <- function(x) {  1/(1+exp(-x)) }
+logit <- function(p) log(p / (1 - p))
+```
+
+For the imputation, we use the mice package. We use pROC for estimating model discrimination, and metamisc for estimating the SE for the observed/expected ratio. For the calibration plots, we use tidyverse, gridExtra grid and gtable.
+```{r,message=T,warning=T,echo=T,eval=F}
+install.packages(c("mice", "pROC", "metamisc"))
+install.packages(c("tidyverse", "gridExtra", "grid", "gtable"))
+library(mice)
+library(pROC)
+library(metamisc)
+library(tidyverse)
+library(gridExtra)
+library(grid)
+library(gtable)
+```
+
+```{r,message=F,warning=F,echo=F,eval=T}
+library(mice)
+library(pROC)
+library(metamisc)
+library(tidyverse)
+library(gridExtra)
+library(grid)
+library(gtable)
+```
+
+
+Please make sure you have mice version `r packageVersion("mice")`:
+  
+```{r, eval = T}
+packageVersion("mice")
+```
+
+# Data
+
+Load the data:
+```{r, eval = F}
+load(file.choose())
+```
+
+In this template file, we use a fictional data set. If you'd like to experiment with the functions in this file, you can use this mock data set. For the remainder of this file, we assume that:
+
+* You have thoroughly checked the validity of your data,
+* categorical variables are stored as factors ("yes" vs "no) for present and absent respectively,
+* continuous variables are stored as numeric.
+* Within-hospital-mortality or 30-day-mortality is coded as "dead" and recovered or censored is recorded as "alive". Alternatively, supply the appropriate value for case_label to the performance measures given in the last section.
+
+```{r, echo=TRUE, eval=TRUE, cache = cache, cache.extra1 = getRversion(), cache.extra2 = Sys.info()[['sysname']]}
+
+# First we create some predictor variables
+n <- 1000
+sex <- !!rbinom(n, 1, .60)
+age <- runif(n, 40, 90)
+ldh <- rnorm(n, age + 85, 25)
+lymphocyte_count <- rnorm(n, 2500, 1000)
+c_reactive_protein <- rexp(n, 1/(age/35 + 83))
+respiratory_rate <- rnorm(n, 14, 2)
+temperature <- rnorm(n, 38, 1)
+fever <- temperature > 38
+
+diabetes <- !!rbinom(n, 1, .26)
+chronic_cardiac_disease <- !!rbinom(n, 1, .30)
+heart_rate <- rnorm(n, diabetes * 10 + chronic_cardiac_disease * 10, 15)
+
+n_comobidities <- diabetes + chronic_cardiac_disease + rbinom(n, 5, .1)
+
+glasgow_coma_scale <- 15 - rbinom(n, 12, .02)
+diastolic <- diabetes * 10 + chronic_cardiac_disease * 10 + rnorm(n, 50, 25)
+systolic <- diastolic + rnorm(n, 55, 20)
+
+haemoglobin <- rnorm(n, 129, 30 * 3/4)
+platelet_count <- rnorm(n, 216, 120 * 3/4)
+oxygen_saturation <- runif(n, .88, 1)
+urea <- rnorm(n, 7, 4)
+ddimer <- rexp(n, .3)
+
+# Then we predict the outcome
+p <- inv_logit(-8 +
+                 3 * (age/mean(age))^2 +
+                 sex +
+                 respiratory_rate/mean(respiratory_rate) +
+                 2 * (oxygen_saturation < .92) +
+                 c_reactive_protein/mean(c_reactive_protein))
+
+# Convert categorical variables to factors
+sex[sex] <- "male"
+sex[sex == "FALSE"] <- "female"
+sex <- factor(sex)
+
+fever[fever] <- "yes"
+fever[fever == "FALSE"] <- "no"
+fever <- factor(fever)
+
+diabetes[diabetes] <- "yes"
+diabetes[diabetes == "FALSE"] <- "no"
+diabetes <- factor(diabetes)
+
+chronic_cardiac_disease[chronic_cardiac_disease] <- "yes"
+chronic_cardiac_disease[chronic_cardiac_disease == "FALSE"] <- "no"
+chronic_cardiac_disease <- factor(chronic_cardiac_disease)
+
+# Draw the outcome, convert to factor
+mortality <- !!rbinom(n, 1, p)
+mortality[mortality] <- "dead"
+mortality[mortality == FALSE] <- "alive"
+mortality <- factor(mortality)
+
+your_data_object <- data.frame(sex,
+                age,
+                ldh,
+                lymphocyte_count,
+                c_reactive_protein,
+                respiratory_rate,
+                temperature,
+                fever = fever,
+                diabetes = diabetes,
+                chronic_cardiac_disease,
+                heart_rate,
+                n_comobidities,
+                glasgow_coma_scale,
+                diastolic,
+                systolic,
+                haemoglobin,
+                platelet_count,
+                oxygen_saturation,
+                urea,
+                ddimer,
+                mortality = mortality)
+
+# And finally, we can remove some random values to add missingness
+for (i in seq_len(ncol(your_data_object)))
+  your_data_object[as.logical(rbinom(n, 1, 0.2)), i] <- NA
+
+```
+
+
+```{r, eval = T, cache = cache, cache.extra1 = getRversion(), cache.extra2 = Sys.info()[['sysname']], cache.extra3 = your_data_object}
+data_miss <- your_data_object
+``` 
+
+# Multiple imputation
+
+First, have a look at the distribution of missingness across the variables in your data:
+```{r}
+round(sort(apply(data_miss, 2, function(x) mean(is.na(x))), decreasing = T), 3)
+
+```
+
+
+### Initialize mice
+
+
+Before running mice for real, we check whether the data is compatible with mice. We use maxit=0, as we don't need any imputations just yet.
+```{r, cache = cache, cache.extra1 = getRversion(), cache.extra2 = Sys.info()[['sysname']], cache.extra3 = data_miss}
+setup_imp <- mice(data_miss, maxit=0)
+```
+
+If you get the following warning message:
+```{r, include = F, echo = T}
+warning("Number of logged events: 1 ")
+```
+
+then inspect the logged events:
+```{r}
+setup_imp$loggedEvents
+```
+In this case there are no logged events. What may happen, for instance, is that the data set contains a collinear variable, which mice then automatically removes. In that case, go a step back, inspect the issue, remove the variable you think needs to be removed and then run the mice initialization again.
+
+Now, inspect the methods that mice has chosen for your data. Do the methods make sense? Note that if a binary variable is coded as 1 vs 0, mice will chose "pmm" instead of "logreg". If coded as factor or Boolean, it should choose "logreg".
+```{r}
+setup_imp$method
+```
+
+If not, then it can be altered as follows:
+```{r}
+setup_imp$method["sex"] <- "logreg"
+```
+
+### Run mice
+
+In order for the imputation to be reproducible, we set a seed for the imputation algorithm:
+
+```{r}
+set.seed(2020)
+```
+
+Now we can perform the imputation. We set the number of imputed data sets to 50 (m = 50).
+```{r, cache = cache, cache.extra1 = getRversion(), cache.extra2 = Sys.info()[['sysname']], cache.extra3 = data_miss}
+data_imp <- mice(data_miss, method = setup_imp$method, m = 50, maxit = 25,  
+                 printFlag = F)
+```
+
+Here you may get warnings that in an iteration one of the conditional imputation models did not converge. If this occurs in your data, especially if it occurs multiple times, consider the following steps:
+
+* Check that the data do not contain collinear variables
+* Try a different imputation method. E.g. pmm instead of logreg for binary variables or norm instead of pmm for binary variables. See Details for the mice function in the mice package for options.
+* Increase maxit
+* Alter the visitSequence
+* Change the seed for the imputation, either through set.seed() or the seed argument in mice().
+
+
+### Inspect the validity of the imputation
+
+A simple plot can be generated as follows. It shows the means and standard deviations for the variables in the data set. The lines in each figure should appear as a random pattern. Specifically:
+
+* The lines should cross multiple times.
+* None of the lines should appear to be stuck at a specific value, i.e. it should not remain flat.
+* In general, no pattern should be present (i.e. not increasing or decreasing)
+
+The following plots all look ok:
+
+```{R, cache = cache, cache.extra1 = getRversion(), cache.extra2 = Sys.info()[['sysname']], cache.extra3 = data_imp}
+plot(data_imp)
+```
+
+
+# Model validation
+
+### Define prediction models
+
+Here we define the 4C Mortality Score by Knight et al. It's easiest to define each prediction model with only a 'data' argument, so that they are compatible with the functions below.
+
+Note that the 4C mortality model does not say what to do with:
+
+* Ages between 59 and 60, etc. We assume these are all integers or rounded downwards.
+* respiratory rate between 29 and 30, etc. We assume these are rounded to the nearest integer.
+* Same for c_reactive_protein.
+  
+  
+```{r}
+
+hu_lp <- function(data) {
+    -4.211 + 0.013 * data$c_reactive_protein + 0.059 * data$age + 
+    0.112 * data$ddimer - 1.984 * data$lymphocyte_count 
+}
+
+humodel <- function(data)
+  inv_logit(hu_lp(data))
+
+knight4cmodel <- function(data) {
+  age                <- data$age
+  sex                <- data$sex
+  n_comobidities     <- data$n_comobidities
+  respiratory_rate   <- data$respiratory_rate
+  oxygen_saturation  <- data$oxygen_saturation
+  glasgow_coma_scale <- data$glasgow_coma_scale
+  urea               <- data$urea
+  c_reactive_protein <- data$c_reactive_protein
+  
+  age <- floor(age)
+  respiratory_rate   <- round(respiratory_rate)
+  oxygen_saturation  <- round(oxygen_saturation)
+  urea               <- round(urea)
+  c_reactive_protein <- round(c_reactive_protein)
+  
+  lp <- ( 
+    -4.203 +
+      
+      0.687 * (age >= 50 & age <= 60) + 
+      1.337 * (age >= 60 & age <= 69) + 
+      1.842 * (age >= 70 & age <= 79) + 
+      2.252 * (age >= 80) + 
+      
+      0.172 * (sex == "male") +
+      
+      0.300 * (n_comobidities == 1) + 
+      0.532 * (n_comobidities >= 2) + 
+      
+      0.232 * (respiratory_rate >= 20 & respiratory_rate <= 29) + # (breaths/minute)
+      0.649 * (respiratory_rate >= 30) +                          # (breaths/minute) 
+      
+      0.577 * (oxygen_saturation < 92) +  # on room air (%) 
+      
+      0.558 * (glasgow_coma_scale < 15) + 
+      
+      0.439 * (urea >= 7 & urea <= 14) +  # (mmol/L)
+      1.011 * (urea > 14) +               # (mmol/L)
+      
+      0.363 * (c_reactive_protein >= 50 & c_reactive_protein <= 99) + # (mg/L)
+      0.740 * (c_reactive_protein >= 100)                             # (mg/L)
+  )
+  
+  return(inv_logit(lp))                   
+}
+
+knight4cscore <- function(data) {
+  age                <- data$age
+  sex                <- data$sex
+  n_comobidities     <- data$n_comobidities
+  respiratory_rate   <- data$respiratory_rate
+  oxygen_saturation  <- data$oxygen_saturation
+  glasgow_coma_scale <- data$glasgow_coma_scale
+  urea               <- data$urea
+  c_reactive_protein <- data$c_reactive_protein
+  
+  age <- floor(age)
+  respiratory_rate   <- round(respiratory_rate)
+  oxygen_saturation  <- round(oxygen_saturation)
+  urea               <- round(urea)
+  c_reactive_protein <- round(c_reactive_protein)
+  
+  score <- ( 
+      2 * (age >= 50 & age <= 60) + 
+      4 * (age >= 60 & age <= 69) + 
+      6 * (age >= 70 & age <= 79) + 
+      7 * (age >= 80) + 
+      
+      1 * (sex == "male") +
+      
+      1 * (n_comobidities == 1) + 
+      2 * (n_comobidities >= 2) + 
+      
+      1 * (respiratory_rate >= 20 & respiratory_rate <= 29) + # (breaths/minute)
+      2 * (respiratory_rate >= 30) +                          # (breaths/minute) 
+      
+      2 * (oxygen_saturation < 92) +  # on room air (%) 
+      
+      2 * (glasgow_coma_scale < 15) + 
+      
+      1 * (urea >= 7 & urea <= 14) +  # (mmol/L)
+      3 * (urea > 14) +               # (mmol/L)
+      
+      1 * (c_reactive_protein >= 50 & c_reactive_protein <= 99) + # (mg/L)
+      2 * (c_reactive_protein >= 100)                             # (mg/L)
+  )
+  
+  index <- score + 1 # The method below does not actually use the values 
+  # within the " ". It uses the supplied value as an index instead. As zero is 
+  # the first value in the list, its index equals score + 1.
+  
+  # The 4C Score does not state what to do with values of 0. In the graphs of 
+  # the manuscript the mortality rate is zero, but this would lead to fitting 
+  # issues with the calibration slope and calibration in the large, so we use a 
+  # value that is practically zero but not exactly.
+  
+  c("0" = 0.00001,
+    "1" = 0.003,
+    "2" = 0.008,
+    "3" = 0.023,
+    "4" = 0.048,
+    "5" = 0.075,
+    "6" = 0.078,
+    "7" = 0.117,
+    "8" = 0.144,
+    "9" = 0.192,
+    "10" = 0.229,
+    "11" = 0.269,
+    "12" = 0.329,
+    "13" = 0.401,
+    "14" = 0.446,
+    "15" = 0.516,
+    "16" = 0.591,
+    "17" = 0.661,
+    "18" = 0.758,
+    "19" = 0.774,
+    "20" = 0.829,
+    "21" = 0.875
+  )[index]
+}
+
+``` 
+
+
+### Performance measures
+Here we define the performance measures. All take the arguments p or lp (predicted risk of short term mortality, or the linear predictor, only one of the two is necessary), and y (observed short term mortality), so that we can use them in the functions below.
+
+Note that we set the direction for auc to be "<", meaning that the the predictor values for the surviving patients are lower or equal than the values of the deceased patients. If we do not set this, a model that has an auc lower than 0.50 will receive a value greater than 0.50 (i.e. 0.40 becomes 1 - 0.40 = 0.60).
+
+For net benefit, see Vickers AJ, Elkin EB. Decision curve analysis: a novel method for evaluating prediction models. Medical Decision Making. 2006 Nov;26(6):565-74.
+
+
+```{r}
+
+calibration_in_the_large <- function(p, y, lp = logit(p), family = binomial, ...) {
+  fit <- glm(y ~ 1, family = family, offset = lp, ...)
+  variance <- diag(vcov(fit))
+  c(estimate = coef(fit), se = sqrt(variance), var = variance)
+}
+
+calibration_slope <- function(p, y, lp = logit(p), family = binomial, ...) {
+  fit <- glm(y ~ lp + 1, family = family, ...)
+  variance <- diag(vcov(fit))[2]
+  c(estimate = coef(fit)[2], se = sqrt(variance), var = variance)
+}
+
+auc <- function(p, y, lp = logit(p), method = "delong", direction = "<", ...) {
+  if (missing(p))
+    p <- inv_logit(lp)
+  fit <- pROC::auc(response = y, 
+                   predictor = p, 
+                   direction = direction, 
+                   method = method, ...)
+  variance <- var(fit)
+  ci <- confint(fit)
+  c(estimate = fit[[1]][[1]], 
+    se = sqrt(variance), 
+    var = variance, 
+    ci.lb = ci$ci.lb, 
+    ci.ub = ci$ci.ub)
+}
+
+# threshold is the decision threshold at which predictions are dichotimized
+# into positive or negative. 
+# equipoise is the value at which FP and FN are considered to be equally bad.
+# i.e. equipoise = .20 means that four FP diagnoses are as bad as one FN.
+# These two are the same when validating a prediction model. Only when
+# considering the 'treat all' strategy they are not equal: threshold is then 0,
+# and equipoise is the clinical equipoise value, (or all values from 0 to 1 in
+# a decision curve analysis).
+
+net_benefit <- function(p, y, lp = logit(p), threshold = .50, equipoise = threshold,
+                        test_harm = 0, case_label = "dead", ...) {
+  if (missing(p))
+    p <- inv_logit(lp)
+  tp <- sum((p >= threshold) & (y == case_label))
+  fp <- sum((p >= threshold) & (y != case_label))
+  n <- length(p)
+
+  if (threshold == 1) { # by definition
+    return(0)
+  } else{return(tp/n - fp/n * equipoise / (1-equipoise) - test_harm)}
+}
+
+net_benefit_bootstrap <- function(p, y, lp = logit(p), threshold = .50, equipoise = threshold,
+                                  test_harm = 0, case_label = "dead", 
+                                  I = 1000, ...) {
+  if (missing(p))
+    p <- inv_logit(lp)
+  nb <- rep(NA, I)
+  for (i in seq_len(I)) {
+    s <- sample.int(length(p), length(p), replace = TRUE)
+    nb[i] <- net_benefit(p[s], y[s], lp, threshold, equipoise, test_harm, case_label, ...)
+  }
+  se <- sd(nb)
+  ci <- quantile(nb, probs = c(.025, .975))
+  est <- net_benefit(p, y, lp, threshold, equipoise, test_harm, case_label, ...)
+  
+  c(estimate = est, se = se, var = se^2, ci.lb = ci[1], ci.ub = ci[2])
+}
+
+oe_ratio <- function(p, y, lp = logit(p), case_label = "dead", log = T, ...) {
+  if (missing(p))
+    p <- inv_logit(lp)
+  O <- sum(y == case_label)
+  E <- sum(p)
+  N <- length(p)
+  g <- if(log) "log(OE)" else NULL
+  
+  fit <- metamisc::oecalc(O = O, E = E, N = N, g = g, ...)
+  
+  c(estimate = fit$theta,
+    se = fit$theta.se,
+    var = fit$theta.se^2,
+    ci.lb = fit$theta.cilb,
+    ci.ub = fit$theta.ciub,
+    O = O,
+    E = E,
+    N = N,
+    log = log)
+}
+
+```
+
+
+```{r, eval = T, echo = F, include = F}
+
+# This is for debugging only
+p <- knight4cscore(complete(data_imp, 1))
+y <- complete(data_imp, 1)$mortality
+lp <- logit(p)
+
+calibration_in_the_large(p = p, y = y)
+calibration_in_the_large(y = y, lp = lp)
+
+calibration_slope(p = p, y = y)
+calibration_slope(y = y, lp = lp)
+
+auc(p = p, y = y)
+auc(y = y, lp = lp)
+
+net_benefit_bootstrap(p = p, y = y)
+net_benefit_bootstrap(y = y, lp = lp)
+
+oe_ratio(p = p, y = y)
+oe_ratio(y = y, lp = lp)
+
+# This shows why exact zeroes need to be avoided,
+# and why we put p = 0.00001 for the zero scores of the 4C score instead.
+# p2 <- p
+# p2[which(!!rbinom(length(p2), 1, .02))] <- 0
+# calibration_in_the_large(p = p2, y = y)
+# calibration_slope(p = p2, y = y)
+
+```
+
+### Validation for MI
+
+Validating a model is a two step procedure:
+
+1. Estimate the probability of mortality for each patient
+2. Estimate the performance measure.
+
+However, the functions in the mice package expect that a single function is applied on the imputed data sets. Further, the with() function does not work with the above function. So we make our own function that can do both tasks (note that some of it is copied from the mice package, specifically mice:::glm.mids). We make it generic, so that we can reuse it. The arguments are:
+
+* \textit{data} : Multiple imputed data set of class mids
+* \textit{model} : Prediction model (as function or character), is assumed to produce a vector of predicted values
+* \textit{measure} : Performance measure (as function or character) 
+* \textit{alpha} : Error level for confidence intervals.
+* ... : Arguments passed to measure.
+
+```{R}
+validate.mids <- function(data, model, measure, alpha = .05, ...) {
+  # From mice
+  call <- match.call()
+  if (!is.mids(data)) {
+    stop("The data must have class mids")
+  }
+  
+  # Make sure that these two are functions:
+  model   <- match.fun(model)
+  measure <- match.fun(measure)
+  
+  # Here we have two steps instead of one.
+  # 1. Predict the outcome
+  predicted_values <- lapply(seq_len(data$m), 
+                             function(i) model(data = complete(data, i)))
+  
+  # 2. Estimate performance
+  analyses <- sapply(seq_len(data$m), 
+                     function(i) measure(
+                       p = predicted_values[[i]], 
+                       y = complete(data, i)$mortality, ...))
+  analyses <- as.data.frame(t(analyses))
+  analyses$ci.lb <- analyses$estimate + qnorm(alpha/2)   * analyses$se
+  analyses$ci.ub <- analyses$estimate + qnorm(1-alpha/2) * analyses$se
+  
+  # From mice                   
+  object <- list(call = call, 
+                 call1 = data$call, 
+                 nmis = data$nmis, 
+                 analyses = analyses)
+  oldClass(object) <- c("mira")
+  object
+}
+
+validate.lp.mids <- function(data, model, measure, alpha = .05, ...) {
+  # From mice
+  call <- match.call()
+  if (!is.mids(data)) {
+    stop("The data must have class mids")
+  }
+  
+  # Make sure that these two are functions:
+  model   <- match.fun(model)
+  measure <- match.fun(measure)
+  
+  # Here we have two steps instead of one.
+  # 1. Predict the outcome
+  linear_predictor <- lapply(seq_len(data$m), 
+                             function(i) model(data = complete(data, i)))
+  
+  # 2. Estimate performance
+  analyses <- sapply(seq_len(data$m), 
+                     function(i) measure(
+                       lp = linear_predictor[[i]], 
+                       y = complete(data, i)$mortality, ...))
+  analyses <- as.data.frame(t(analyses))
+  analyses$ci.lb <- analyses$estimate + qnorm(alpha/2)   * analyses$se
+  analyses$ci.ub <- analyses$estimate + qnorm(1-alpha/2) * analyses$se
+  
+  # From mice                   
+  object <- list(call = call, 
+                 call1 = data$call, 
+                 nmis = data$nmis, 
+                 analyses = analyses)
+  oldClass(object) <- c("mira")
+  object
+}
+
+# For data sets for which we only have the outcomes and predicted values
+# after MI has been performed, we can use this function which skips the 
+# first steps.
+validate.mids.predicted <- function(data, p_name, y_name, measure, alpha = .05, ...) {
+  measure <- match.fun(measure)
+  call <- match.call()
+    
+  #  Estimate performance
+  analyses <- sapply(seq_len(length(data)), 
+                     function(i) measure(
+                       p = data[[i]][ , p_name], 
+                       y = data[[i]][ , y_name], ...))
+  analyses <- as.data.frame(t(analyses))
+  analyses$ci.lb <- analyses$estimate + qnorm(alpha/2)   * analyses$se
+  analyses$ci.ub <- analyses$estimate + qnorm(1-alpha/2) * analyses$se
+  
+  # From mice                   
+  object <- list(call = call, 
+                 call1 = data$call, 
+                 nmis = data$nmis, 
+                 analyses = analyses)
+  oldClass(object) <- c("mira")
+  object
+}
+ 
+```
+
+Next, we pool the performance estimates across important data sets. As the pool function from the mice package does not work with some performance measures, we use the older function pool.scalar instead. As the auc is not normally distributed (as it is bounded from 0 to 1), we cannot use a method that assumes normality, like pool.scalar. We use some modified code from the psfmi package instead.
+```{R}
+
+pool.validate.mids <- function(object, alpha = .05, ...) {
+  fit <- pool.scalar(Q = object$analyses$estimate, 
+                     U = object$analyses$var, 
+                     n = nrow(object$analyses))
+  
+  list("invididual" = data.frame(estimate = fit$qhat, 
+                                 var = fit$u, 
+                                 se = sqrt(fit$u),
+                                 ci.lb = object$analyses$ci.lb,
+                                 ci.ub = object$analyses$ci.ub),
+       "pooled" = data.frame(estimate = fit$qbar,
+                             variance = fit$t,
+                             within = fit$ubar,
+                             between = fit$b,
+                             se = sqrt(fit$t),
+                             ci.lb = fit$qbar + qnorm(alpha/2) * sqrt(fit$t),
+                             ci.ub = fit$qbar + qnorm(1 - alpha/2) * sqrt(fit$t),
+                             df = fit$df,
+                             r = fit$r,
+                             fmi = fit$fmi,
+                             m = fit$m))
+}
+
+pool.auc.mids <- function(object, alpha = .05, ...) {
+  m <- length(object$analyses$se)
+  
+  logit <- function(x) log(x / (1-x))
+  inv_logit <- function(x) {1/(1+exp(-x))}  
+  
+  # Estimates from individual studies
+  ind <- list(auc = data.frame(est = object$analyses$estimate,
+                               se = object$analyses$se,
+                               ci.lb = object$analyses$ci.lb,
+                               ci.ub = object$analyses$ci.ub))
+  ind$logit.auc = data.frame(est = logit(ind$auc$est),
+                             se = ind$auc$se / (ind$auc$est * (1 - ind$auc$est)),
+                             ci.lb = logit(ind$auc$ci.lb),
+                             ci.ub = logit(ind$auc$ci.ub))
+  
+  # Pooled across imputed data sets
+  logit.auc <- list()
+  logit.auc$estimate <- mean(ind$logit.auc$est)
+  logit.auc$within <- mean(ind$logit.auc$se^2)
+  logit.auc$between <- (1 + (1/m)) * var(ind$logit.auc$est)
+  logit.auc$var <- logit.auc$within + logit.auc$between
+  logit.auc$se <- sqrt(logit.auc$var)
+  logit.auc$ci.lb <- logit.auc$est + qnorm(alpha/2)     * logit.auc$se
+  logit.auc$ci.ub <- logit.auc$est + qnorm(1 - alpha/2) * logit.auc$se
+  logit.auc$m <- m
+  
+  auc <- list()
+  auc$estimate <- inv_logit(logit.auc$est)
+  auc$ci.lb <- inv_logit(logit.auc$ci.lb)
+  auc$ci.ub <- inv_logit(logit.auc$ci.ub)
+  auc$m <- m
+  
+  return(list(individual = ind, 
+              pooled = list(logit.auc = as.data.frame(logit.auc), 
+                            auc = as.data.frame(auc))))
+}
+
+pool.oe.mids <- function(object, alpha = .05, ...) {
+  fit <- pool.validate.mids(object, alpha = alpha, ...)
+  
+  if (!object$analyses$log[[1]]) return(list(oe = fit))
+  
+  oe <- list(individual = exp(fit$invididual))
+  oe$individual$var <- NULL
+  oe$individual$se <- NULL
+  
+  oe$pooled <- data.frame(estimate = exp(fit$pooled$estimate),
+                          ci.lb = exp(fit$pooled$ci.lb),
+                          ci.ub = exp(fit$pooled$ci.ub))
+  
+  list(log_oe = fit,
+       oe = oe)
+}
+
+```
+
+For calibration plots, we use cal_plot to make a plot and model_cal_plot to apply it to our data and prediction models, and align_plots to align the scales of the plots. The arguments are as follows:
+
+* _data_ : A data.frame that contains all the predictors for the model to be validated
+* _model\_name_ : character name of the model to be validated. Will be added to the title of the plot.
+* _model_ : The function that produces the predicted outcomes for this prediction model. This argument can be left out if model\_name is also the name of the function (as in this example).
+* _data\_name_ : character name of your data. Will be added to the title of the plot.
+* _imp_ : integers that describe which imputed data sets are to be imputed, if a mids object is supplied. Defaults to all data sets.
+* _case_label_ : character name of the factor level that describes a case of mortality.
+
+```{R}
+
+model_cal_plot <- function(data, 
+                           model_name, 
+                           model = match.fun(model_name), 
+                           data_name = "fictional data",
+                           imp = seq_len(data$m),  
+                           case_label = "dead") {
+  # If data is a multiple imputed object, we extract all imputed data sets and
+  # stack them.
+  if (is.mids(data)) data <- complete(data, imp)
+  
+  # Predict outcomes
+  model <- match.fun(model)
+  p <- model(data)
+  pp <<- p
+  
+  # Convert outcome to binary
+  y <- data$mortality
+  y_binary <- rep(0, length(y))
+  y_binary[y == case_label] <- 1
+  
+  title <- paste0(model_name, " in ", data_name)
+
+  cal_plot(data.frame(p = p, y = y_binary), title)
+}
+
+#https://stackoverflow.com/questions/26159495/align-multiple-ggplot-graphs-with-and-without-legends
+align_plots <- function(...) {
+  plots.grobs <- lapply(list(...), ggplotGrob)
+  max.widths <- do.call(unit.pmax, lapply(plots.grobs, "[[", "widths"))
+  plots.grobs.eq.widths <- lapply(plots.grobs, function(x) {
+    x$widths <- max.widths
+    x
+  })
+
+  LegendWidth <- function(x) x$grobs[[8]]$grobs[[1]]$widths[[4]]
+  legends.widths <- lapply(plots.grobs, LegendWidth)
+
+  max.legends.width <- if(!is.null(unlist(legends.widths))) 
+    do.call(max, legends.widths) else 0
+
+  out <- lapply(plots.grobs.eq.widths, function(x) {
+    if (is.gtable(x$grobs[[8]])) {
+      x$grobs[[8]] <- gtable_add_cols(x$grobs[[8]],
+                                      unit(abs(diff(c(LegendWidth(x),
+                                                      max.legends.width))),
+                                           "mm"))
+    }
+    x
+  })
+
+  out
+}
+
+cal_plot <- function(data, title){
+  
+  library(tidyverse)
+  library(gridExtra)
+  library(grid)
+  library(gtable)
+          
+  # we reduce the expand param, as the plot should not exceed c(0,1) by too much
+  e <- 0.01
+
+  # The calibration plot        
+    # Bin prediction into 10ths
+  g1 <- mutate(data, bin = ntile(p, 10)) %>% 
+    group_by(bin) %>%
+    
+    # Estimate Observed and expected per bin
+    mutate(n = n(), 
+           bin_pred = mean(p), 
+           bin_prob = mean(y)) %>%
+    ungroup() %>%
+    
+    # Plot figure and bins
+    ggplot(aes(x = bin_pred, y = bin_prob, ymin = bin_prob, ymax = bin_prob)) +
+    geom_pointrange(size = 0.5, color = "black") +
+    
+    # plot axes
+    scale_y_continuous(expand = c(e, e), breaks = seq(0, 1, by = 0.1)) +
+    scale_x_continuous(expand = c(e, e), breaks = seq(0, 1, by = 0.1)) +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) + 
+    
+    # 45 degree line indicating perfect calibration
+    geom_abline()  + 
+    
+    # straight line fit through estimates
+    geom_smooth(method = "lm", se = FALSE, linetype = "dashed",
+                color = "black", formula = y ~ x) +
+    
+    # loess fit through estimates
+    geom_smooth(method = "loess", se = FALSE, formula = y ~ x, span = 1) +
+    
+    xlab("") +
+    ylab("Observed Probability") +
+    theme_minimal()+
+    ggtitle(title)
+  
+  # The distribution plot
+  g2 <- ggplot(data, aes(x = p)) +
+    geom_histogram(fill = "black", bins = 100) +
+    scale_x_continuous(expand = c(e, e), 
+                       breaks = seq(0, 1, by = 0.1)) +
+    coord_cartesian(xlim = c(0, 1)) + 
+    xlab("Predicted Probability") +
+    ylab("Count") +
+    theme_minimal() +
+    scale_y_continuous() + 
+    theme(panel.grid.minor = element_blank())
+
+  # Combine them
+  g12 <- align_plots(g1, g2)
+  do.call(function(...) grid.arrange(..., heights = c(1, .35)), g12)
+}
+
+
+
+
+```
+
+```{r, include= FALSE, eval = FALSE, echo = FALSE}
+# Testing only
+model_cal_plot(complete(data_imp, 1), "knight4cscore", data_name = "fictional data")
+
+model_cal_plot(data_imp, imp = 1:10, "knight4cscore", data_name = "fictional data")
+model_cal_plot(data_imp, "knight4cscore", data_name = "fictional data")
+
+c
+table(cut(pp, seq(-.005, 1.005, by = .01), labels = F))
+
+
+```
+
+### Estimate performance
+
+We apply the functions we defined above to validate the model in the imputed data sets.
+
+
+
+```{r, cache = cache, cache.extra1 = getRversion(), cache.extra2 = Sys.info()[['sysname']], cache.extra3 = data_imp, cache.extra4 = auc, , cache.extra5 = calibration_slope, cache.extra6 = calibration_in_the_large}
+
+est_auc <- validate.mids(data = data_imp,
+                     model = "knight4cscore",
+                     measure = auc,
+                     quiet = F)
+
+est_slope <- validate.mids(data = data_imp,
+                     model = "knight4cscore",
+                     measure = calibration_slope)
+
+est_int <- validate.mids(data = data_imp,
+                     model = "knight4cscore",
+                     measure = calibration_in_the_large)
+
+
+est_int <- validate.lp.mids(data = data_imp,
+                     model = "hu_lp",
+                     measure = calibration_in_the_large)
+
+
+```
+
+```{r, cache = cache, cache.extra1 = getRversion(), cache.extra2 = Sys.info()[['sysname']], cache.extra3 = data_imp, cache.extra4 = oe_ratio}
+
+est_log_oe <- validate.mids(data = data_imp,
+                            model = "knight4cscore",
+                            measure = oe_ratio,
+                            log = TRUE)
+
+est_log_oe <- validate.mids(data = data_imp,
+                            model = "knight4cmodel",
+                            measure = oe_ratio,
+                            log = TRUE)
+```
+
+```{r, cache = cache, cache.extra1 = getRversion(), cache.extra2 = Sys.info()[['sysname']], cache.extra3 = data_imp, cache.extra4 = net_benefit_bootstrap}
+
+est_nb <- validate.mids(data = data_imp,
+                     model = "knight4cscore",
+                     measure = net_benefit_bootstrap)
+
+
+```
+
+
+
+And then we pool the results across the imputed data sets, according to Rubin's rules. The code we defined above produces a dataframe, where "estimate" is the pooled estimate (i.e. the one of interest), and "variance" is its variance. "within" is the mean of the estimated variance within each imputed data set, whereas "between" is the variance across imputed data sets. These two are pooled using Rubin's rules, to obtain "estimate",  as described previously. fmi is the fraction of missing information due to nonresponse. For the other statistics, see the mice package, under pool.scalar 
+```{r}
+
+
+pool.auc.mids(est_auc)
+
+pool.validate.mids(est_slope)
+pool.validate.mids(est_int)
+
+pool.oe.mids(est_log_oe)
+
+
+pool.validate.mids(est_nb)
+
+```
+
+
+```{r, eval = F, include = F}
+# Confirm that our method produces the same estimates as psfmi.
+
+psfmi::pool_auc(est_auc$analyses$estimate, est_auc$analyses$se, nimp = length(est_auc$analyses$se), log_auc = TRUE)
+pool.auc.mids(est_auc)
+
+``` 
+
+
+We use model_cal_plot to produce a calibration plot of all the imputed data sets stacked in one one data set. The advantage of this approach is that it retains the uncertainty that we modeled with mice. An issue that remains with this approach is that we cannot compute standard errors.
+
+
+```{r, cache = cache, cache.extra1 = getRversion(), cache.extra2 = Sys.info()[['sysname']], cache.extra3 = data_imp, cache.extra4 = model_cal_plot, cache.extra.5 = cal_plot}
+model_cal_plot(data_imp, "knight4cscore", data_name = "fictional data")
+
+# model_cal_plot(data_imp, "knight4cmodel", data_name = "fictional data")
+```
+
+Alternatively, to reduce the number of plots, we could plot the validation results in each of the validation data sets in one plot, for each model. If all contributing partners send the predicted probabilities of the outcomes and the observed outcomes, we can do this. As the outcomes are then not connected to any other data they are fully anonymous. 
+
+```{R}
+data_stacked <- data.frame(complete(data_imp, seq_len(data_imp$m)))
+p_stacked_knight4cscore <- knight4cscore(data_stacked)
+
+oe <- data.frame(o = data_stacked$mortality,
+                 knight4cscore = p_stacked_knight4cscore)
+```
+
+
