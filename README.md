@@ -1,2 +1,2 @@
 # COVID-19_Prognosis_IPDMA
-Meta-analysis of mortality prognosis estimates using individual participant data of COVID-19 patients
+Clinical prediction models for mortality in COVID-19 patients: an external validation and individual participant data meta-analysis (COVID-PRECISE) 
