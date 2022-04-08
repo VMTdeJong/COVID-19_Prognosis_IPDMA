@@ -1,0 +1,135 @@
+Do-file
+
+
+
+C-statistics
+
+
+
+4C
+
+
+
+meta set logitc logitcSE if Model=="4C", random(reml) studylabel( Country )
+
+meta summarize, random(reml) se(khartung)
+
+meta forestplot, random(reml) se(khartung) eform() transform(invlogit) xline(0.5)
+
+
+
+
+
+Hu
+
+meta set logitc logitcSE if Model=="Hu", random(reml) studylabel( Country )
+
+meta summarize, random(reml) se(khartung)
+
+meta forestplot, random(reml) se(khartung) eform() transform(invlogit) xline(0.5)
+
+
+
+
+
+Xie
+
+meta set logitc logitcSE if Model=="Xie", random(reml) studylabel( Country )
+
+meta summarize, random(reml) se(khartung)
+
+meta forestplot, random(reml) se(khartung) eform() transform(invlogit) xline(0.5)
+
+
+
+
+
+
+
+Wang clinical
+
+meta set logitc logitcSE if Model=="Wang clinical", random(reml) studylabel( Country )
+
+meta summarize, random(reml) se(khartung)
+
+meta forestplot, random(reml) se(khartung) eform() transform(invlogit) xline(0.5)
+
+
+
+
+
+Zhang DCSL
+
+meta set logitc logitcSE if Model=="Zhang DCSL", random(reml) studylabel( Country )
+
+meta summarize, random(reml) se(khartung)
+
+meta forestplot, random(reml) se(khartung) eform() transform(invlogit) xline(0.5)
+
+
+
+Log: O:E
+
+
+
+
+
+4C
+
+
+
+meta set logitoe logitcSE if Model=="4C", random(reml) studylabel( Country )
+
+meta summarize, random(reml) se(khartung)
+
+meta forestplot, random(reml) se(khartung) eform() xline(0)
+
+
+
+
+
+Hu
+
+meta set logitoe logitcSE if Model=="Hu", random(reml) studylabel( Country )
+
+meta summarize, random(reml) se(khartung) eform()
+
+meta forestplot, random(reml) se(khartung) eform() xline(0)
+
+
+
+
+
+Xie
+
+meta set logitoe logitcSE if Model=="Xie", random(reml) studylabel( Country )
+
+meta summarize, random(reml) se(khartung)
+
+meta forestplot, random(reml) se(khartung) eform() xline(0)
+
+
+
+
+
+
+
+Wang clinical
+
+meta set logitoe logitcSE if Model=="Wang clinical", random(reml) studylabel( Country )
+
+meta summarize, random(reml) se(khartung)
+
+meta forestplot, random(reml) se(khartung) eform() xline(0)
+
+
+
+
+
+Zhang DCSL
+
+meta set logitoe logitcSE if Model=="Zhang DCSL", random(reml) studylabel( Country )
+
+meta summarize, random(reml) se(khartung)
+
+meta forestplot, random(reml) se(khartung) eform() xline(0)
